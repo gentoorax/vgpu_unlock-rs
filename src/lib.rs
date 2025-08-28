@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: MIT
 
 //! Credit to community members for most of the work with notable contributions by:
@@ -232,7 +233,7 @@ struct ProfileOverridesConfig {
     vm: HashMap<String, VgpuProfileOverride>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct VgpuProfileOverride {
     gpu_type: Option<u32>,
     card_name: Option<String>,
@@ -264,6 +265,32 @@ struct VgpuProfileOverride {
     license_type: Option<String>,
 }
 
+fn patch_fb_length_guess(blob: &mut [u8], desired_encoded: u64) -> bool {
+    // Heuristic: v19 encodes fb_length as (size_bytes << 32) | 0x00000004
+    // Scan for the first u64 whose low dword is 0x00000004 and high dword
+    // looks like a size (between 256 MiB and 64 GiB).
+    let mut i = 0usize;
+    while i + 8 <= blob.len() {
+        let val = u64::from_le_bytes([
+            blob[i], blob[i + 1], blob[i + 2], blob[i + 3],
+            blob[i + 4], blob[i + 5], blob[i + 6], blob[i + 7],
+        ]);
+        let low = (val & 0xFFFF_FFFF) as u32;
+        let high = (val >> 32) as u32;
+        if low == 0x0000_0004 {
+            // 256 MiB ..= 64 GiB
+            if high >= 0x1000_0000 && (high as u64) <= (64u64 * 1024 * 1024 * 1024) {
+                // patch and stop
+                let bytes = desired_encoded.to_le_bytes();
+                blob[i..i + 8].copy_from_slice(&bytes);
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 fn check_size(name: &str, actual_size: usize, expected_size: usize) -> bool {
     if actual_size != expected_size {
         error!(
@@ -275,6 +302,51 @@ fn check_size(name: &str, actual_size: usize, expected_size: usize) -> bool {
     } else {
         true
     }
+}
+
+fn load_overrides() -> Result<String, bool> {
+    let config_path = match env::var_os("VGPU_UNLOCK_PROFILE_OVERRIDE_CONFIG_PATH") {
+        Some(path) => PathBuf::from(path),
+        None => PathBuf::from(DEFAULT_PROFILE_OVERRIDE_CONFIG_PATH),
+    };
+
+    let config_overrides = match fs::read_to_string(&config_path) {
+        Ok(data) => data,
+        Err(e) => {
+            if e.kind() == ErrorKind::NotFound {
+                error!("Config file '{}' not found", config_path.display());
+                return Err(true);
+            }
+
+            error!("Failed to read '{}': {}", config_path.display(), e);
+            return Err(false);
+        }
+    };
+
+    Ok(config_overrides)
+}
+
+/// Return framebuffer override (in bytes) if present for current context.
+fn get_override_framebuffer() -> Option<u64> {
+    let overrides = load_overrides().ok()?;
+    let parsed: ProfileOverridesConfig = toml::from_str(&overrides).ok()?;
+
+    // Prefer an mdev-specific override.
+    if let Some(uuid) = LAST_MDEV_UUID.lock().clone().map(|u| u.to_string()) {
+        if let Some(v) = parsed.mdev.get(uuid.as_str()).and_then(|o| o.framebuffer) {
+            return Some(v);
+        }
+        #[cfg(feature = "proxmox")]
+        if let Some(vmid) = crate::utils::uuid_to_vmid(LAST_MDEV_UUID.lock().clone()?) {
+            if let Some(v) = parsed.vm.get(vmid.to_string().as_str()).and_then(|o| o.framebuffer) {
+                return Some(v);
+            }
+        }
+    }
+
+    // Fallback to profile-level override.
+    // Note: requires a config struct to know the current profile; handled in handle_profile_override for v17/v18.
+    None
 }
 
 /// # Safety
@@ -450,16 +522,29 @@ pub unsafe extern "C" fn ioctl(fd: RawFd, request: c_ulong, argp: *mut c_void) -
                 *LAST_MDEV_UUID.lock() = Some(params.vgpu_name);
             }
             NVA081_CTRL_CMD_VGPU_CONFIG_GET_VGPU_TYPE_INFO => {
-                // 18.0 driver sends larger struct with size 5232 bytes, 17.0 driver sends larger struct with size 5096 bytes. Only extra members added at the end,
-                // nothing in between or changed, so accessing the larger struct is "safe"
-                if io_data.params_size == 5424
-                    || io_data.params_size == 5232
+                if io_data.params_size == 5424 {
+                    // v19 path: struct layout changed; patch fb_length in-place using the override.
+                    if let Some(fb_bytes) = get_override_framebuffer() {
+                        let desired_encoded: u64 = ((fb_bytes as u64) << 32) | 0x0000_0004;
+                        let blob = std::slice::from_raw_parts_mut(
+                            io_data.params.cast::<u8>(),
+                            io_data.params_size as usize,
+                        );
+                        if !patch_fb_length_guess(blob, desired_encoded) {
+                            error!("v19: failed to locate fb_length in params blob; override not applied");
+                        } else {
+                            info!("v19: applied fb_length override from profile_override.toml");
+                        }
+                    }
+                    // fall-through (do not return here)
+                } else if io_data.params_size == 5232
                     || io_data.params_size == 5096
                     || check_size!(
                         NVA081_CTRL_CMD_VGPU_CONFIG_GET_VGPU_TYPE_INFO,
                         NvA081CtrlVgpuConfigGetVgpuTypeInfoParams
                     )
                 {
+                    // v17/v18 path: use typed struct and normal override handler
                     let params: &mut NvA081CtrlVgpuConfigGetVgpuTypeInfoParams =
                         &mut *io_data.params.cast();
                     info!("{:#?}", params);
@@ -468,6 +553,9 @@ pub unsafe extern "C" fn ioctl(fd: RawFd, request: c_ulong, argp: *mut c_void) -
                         error!("Failed to apply profile override");
                         return -1;
                     }
+                } else {
+                    error!("Unexpected params_size={}", io_data.params_size);
+                    return -1;
                 }
             }
             NVA082_CTRL_CMD_HOST_VGPU_DEVICE_GET_VGPU_TYPE_INFO
@@ -508,28 +596,6 @@ pub unsafe extern "C" fn ioctl(fd: RawFd, request: c_ulong, argp: *mut c_void) -
     }
 
     ret
-}
-
-fn load_overrides() -> Result<String, bool> {
-    let config_path = match env::var_os("VGPU_UNLOCK_PROFILE_OVERRIDE_CONFIG_PATH") {
-        Some(path) => PathBuf::from(path),
-        None => PathBuf::from(DEFAULT_PROFILE_OVERRIDE_CONFIG_PATH),
-    };
-
-    let config_overrides = match fs::read_to_string(&config_path) {
-        Ok(data) => data,
-        Err(e) => {
-            if e.kind() == ErrorKind::NotFound {
-                error!("Config file '{}' not found", config_path.display());
-                return Err(true);
-            }
-
-            error!("Failed to read '{}': {}", config_path.display(), e);
-            return Err(false);
-        }
-    };
-
-    Ok(config_overrides)
 }
 
 fn handle_profile_override<C: VgpuConfigLike>(config: &mut C) -> bool {
